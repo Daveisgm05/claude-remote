@@ -165,7 +165,8 @@ Four properties, each chosen deliberately:
 * **`.gitignore` is honoured**, so `node_modules` never crosses the wire. On
   these repos that is ~500 tracked files instead of 4 GB.
 
-Install: copy `mac/ccr-autosave` to `~/bin/`, list your folders in
+Install: copy `mac/ccr-autosave` to `~/bin/`, set `CCR_SERVER=claude@<your-host>`
+(edit the default at the top of the script, or export it in the plist), list your folders in
 `~/.config/ccremote/autosave.conf` (TAB-separated: local path, then the folder
 name on the server), copy `mac/com.ccremote.autosave.plist` into
 `~/Library/LaunchAgents/` and `launchctl load` it. Log: `/tmp/ccr-autosave.log`.

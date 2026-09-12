@@ -14,7 +14,9 @@ EnvironmentFile=/etc/ccremote.env
 ExecStart=/opt/ccremote/.venv/bin/python -m orchestrator.app
 Restart=always
 RestartSec=3
-NoNewPrivileges=yes
+# No NoNewPrivileges= here: it forbids setuid for every child of the service,
+# and "sudo ccr-git" from inside a session is exactly that. The sudoers file
+# (/etc/sudoers.d/ccremote) is what limits what sudo can do instead.
 StandardOutput=journal
 StandardError=journal
 
