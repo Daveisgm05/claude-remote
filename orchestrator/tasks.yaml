@@ -1,0 +1,161 @@
+# Which folders your phone can talk to, and with which Claude Code flags.
+# Reload without restarting:
+#   curl -XPOST -H "X-Token: $CCR_TOKEN" localhost:8080/api/reload
+#
+# HOW THE PERMISSION FLAGS ACTUALLY BEHAVE (measured against claude 2.1.257,
+# not assumed -- get this wrong and the guardrails are decorative):
+#
+#   permission_mode: dontAsk   Anything not on allowed_tools is DENIED and shows
+#                              up in the app as "N denied". This is the mode that
+#                              makes an allowlist mean something headlessly.
+#   permission_mode: acceptEdits  Does NOT enforce the allowlist. A plain
+#                              "rm -f <file>" ran and deleted the file even
+#                              though Bash was not allowed. Don't use it here.
+#   allowed_tools:             ADDITIVE. It says what may proceed without
+#                              asking; on its own it restricts nothing.
+#   tools:                     The hard boundary. Lists which built-in tools
+#                              exist at all. Required alongside `restricted`
+#                              for Bash and WebFetch, which it drops otherwise.
+#   restricted: true           Confines the file tools to the project folder.
+#                              MEASURED: without it, an allowlisted Read reached
+#                              a file outside the project with zero denials --
+#                              on your server that would include /opt/*/.env.
+#                              It also ignores user/project/local settings files,
+#                              so a stray allow rule in ~/.claude cannot widen
+#                              what these sessions may do. `settings:` below
+#                              still applies.
+#
+# Nothing here ever passes --dangerously-skip-permissions.
+
+
+# Every folder under this root is reachable from the phone, and new ones can be
+# created there from the phone. Nothing is hardcoded: making a folder is enough
+# to make it a project. The root is the only boundary -- a path that resolves
+# outside it (through .., through a symlink) is refused before anything runs.
+workspace:
+  root: ~/projects
+  default_profile: default
+
+
+profiles:
+
+  # Everyday work: reads and edits freely, runs only the commands listed.
+  default:
+    model: sonnet
+    permission_mode: dontAsk
+    max_budget_usd: 5
+    restricted: true
+    tools: [Read, Glob, Grep, Edit, Write, NotebookEdit, TodoWrite, Task, Bash, WebSearch, WebFetch]
+    settings:
+      permissions:
+        blockReadsOutsideWorkingDirectories: true
+    allowed_tools:
+      - Read
+      - Glob
+      - Grep
+      - Edit
+      - Write
+      - NotebookEdit
+      - TodoWrite
+      - Task
+      - WebSearch
+      - WebFetch
+      - "Bash(git status*)"
+      - "Bash(git diff*)"
+      - "Bash(git log*)"
+      - "Bash(git show*)"
+      - "Bash(git add*)"
+      - "Bash(git commit*)"
+      - "Bash(git checkout*)"
+      - "Bash(git branch*)"
+      - "Bash(git fetch*)"
+      - "Bash(git remote*)"
+      - "Bash(mkdir*)"
+      # Clone or update ANY of your GitHub repositories. The helper runs git as
+      # root with the token supplied through GIT_ASKPASS; the session can invoke
+      # it but cannot read the token, and it only accepts owner/name plus a plain
+      # folder name, so no git option can be smuggled in.
+      - "Bash(sudo ccr-git*)"
+      - "Bash(ls*)"
+      - "Bash(head*)"
+      - "Bash(tail*)"
+      - "Bash(rg*)"
+      - "Bash(find*)"
+      - "Bash(npm run*)"
+      - "Bash(npm test*)"
+      - "Bash(pnpm*)"
+      - "Bash(pytest*)"
+      - "Bash(python -m pytest*)"
+      - "Bash(make*)"
+
+  # Questions about a codebase with no way to change anything: the tools that
+  # could write or run commands are not present in the session at all.
+  readonly:
+    model: sonnet
+    permission_mode: dontAsk
+    max_budget_usd: 2
+    restricted: true
+    tools: [Read, Glob, Grep, WebSearch, WebFetch, TodoWrite]
+    strict_mcp_config: true
+    allowed_tools: [Read, Glob, Grep, WebSearch, WebFetch, TodoWrite]
+
+  # Long or open-ended work. Bash is unrestricted, so point this only at
+  # folders where that is genuinely fine.
+  full:
+    model: opus
+    fallback_model: sonnet
+    permission_mode: dontAsk
+    max_budget_usd: 15
+    restricted: true
+    tools: [Read, Glob, Grep, Edit, Write, NotebookEdit, TodoWrite, Task, Bash, WebSearch, WebFetch]
+    settings:
+      permissions:
+        blockReadsOutsideWorkingDirectories: true
+    allowed_tools:
+      [Read, Glob, Grep, Edit, Write, NotebookEdit, TodoWrite, Task,
+       WebSearch, WebFetch, Bash, "Bash(sudo ccr-git*)"]
+
+  # Stops rather than doing anything irreversible. The app marks the session
+  # "blocked", pushes the question to your phone, and you reply to continue.
+  checkpoint:
+    model: sonnet
+    permission_mode: dontAsk
+    max_budget_usd: 5
+    restricted: true
+    tools: [Read, Glob, Grep, Edit, Write, TodoWrite, Bash]
+    allowed_tools:
+      [Read, Glob, Grep, Edit, Write, TodoWrite, "Bash(git status*)", "Bash(git diff*)"]
+    append_system_prompt: >-
+      Before doing anything irreversible (pushing, deleting, force-updating,
+      deploying, or touching production), stop and end your reply with a single
+      line starting with "NEEDS_HUMAN:" followed by the question. Wait for the
+      answer instead of guessing.
+
+
+projects:
+
+  # OPTIONAL. Shortcuts pinned to the top of the folder picker: a friendlier
+  # name and their own profile. Folders NOT listed here are still reachable --
+  # browse to them, or make them, from the phone.
+  #
+  # key:                    internal name
+  #   name:                 what the phone shows
+  #   path:                 the folder on the server
+  #   profile:              which profile above
+  #   branch_per_session:   true = each session gets its own git worktree and
+  #                         a ccr/<id> branch; false = run in the folder itself
+
+  startup:
+    name: Startup
+    path: ~/projects/startup
+    profile: default
+
+  outreach:
+    name: Lead outreach
+    path: ~/projects/lead-outreach-system
+    profile: default
+
+  motion:
+    name: Motion ad
+    path: ~/projects/motion-ad
+    profile: default

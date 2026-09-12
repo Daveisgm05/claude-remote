@@ -1,0 +1,22 @@
+# Reference copy. bootstrap.sh writes this to /etc/systemd/system/ccremote.service
+# with the real user and paths substituted in.
+[Unit]
+Description=Claude Code Remote orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude
+Group=claude
+WorkingDirectory=/opt/ccremote
+EnvironmentFile=/etc/ccremote.env
+ExecStart=/opt/ccremote/.venv/bin/python -m orchestrator.app
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

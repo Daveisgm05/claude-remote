@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Mirror this Mac's LIVE working state to the remote-control server -- including
+# edits that are not committed and files that are not tracked -- so a session
+# started from the phone sees what is actually on the laptop right now, not the
+# last thing that was pushed to GitHub.
+#
+# How it works, and why it is safe to run every couple of minutes:
+#   * The worktree is snapshotted into a commit object built in a THROWAWAY
+#     index. Your real index, HEAD, branch and stash are never touched. Running
+#     this changes nothing you can observe in the repo.
+#   * The snapshot is pushed straight to the server over SSH, to a dedicated
+#     ref (refs/heads/autosave/mac). It never goes to GitHub, so work in progress
+#     is not published -- which matters, since some of these repos are public.
+#   * It pushes to a branch the server does not have checked out, so it cannot
+#     disturb whatever a phone session is doing.
+#   * .gitignore is honoured, so node_modules and build output never cross the
+#     wire. On these repos that is the difference between ~500 files and 4 GB.
+#
+# Configure in ~/.config/ccremote/autosave.conf, one per line:
+#     /Users/you/some-repo <TAB or space> remote-folder-name
+set -uo pipefail
+
+SERVER="${CCR_SERVER:-claude@your-server.tailnet.ts.net}"
+REMOTE_PROJECTS="${CCR_REMOTE_PROJECTS:-/home/claude/projects}"
+CONF="${CCR_AUTOSAVE_CONF:-$HOME/.config/ccremote/autosave.conf}"
+STATE="${CCR_AUTOSAVE_STATE:-$HOME/.config/ccremote/autosave.state}"
+REF="refs/heads/autosave/mac"
+LOG_TAG="ccr-autosave"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+
+[[ -f $CONF ]] || { log "no config at $CONF"; exit 0; }
+mkdir -p "$(dirname "$STATE")"; touch "$STATE"
+
+# Nothing to do while the server is unreachable (offline, or Tailscale down).
+if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$SERVER" true 2>/dev/null; then
+  log "server unreachable; skipping"
+  exit 0
+fi
+
+pushed=0 skipped=0 failed=0
+
+# Split on TAB only. Folder names legitimately contain spaces (this very repo
+# lives in one), and the default IFS would tear such a path in half.
+while IFS=$'\t' read -r dir name; do
+  dir="${dir%"${dir##*[![:space:]]}"}"   # trim trailing whitespace
+  name="${name%"${name##*[![:space:]]}"}"
+  [[ -z ${dir:-} || ${dir:0:1} == "#" ]] && continue
+  [[ -n ${name:-} ]] || name="$(basename "$dir")"
+  if [[ ! -d $dir/.git ]]; then
+    log "SKIP $name: not a git repository (run 'git init' there to include it)"
+    ((skipped++)); continue
+  fi
+
+  # Snapshot the worktree in a scratch index so the real repo is untouched.
+  # If mktemp ever failed, GIT_INDEX_FILE would be empty and git would fall
+  # back to the REAL index -- read-tree would then stage things in the user's
+  # actual repo. Refuse to continue rather than touch it.
+  idx="$(mktemp 2>/dev/null)"
+  if [[ -z ${idx:-} || ! -f $idx ]]; then
+    log "SKIP $name: could not create a scratch index (TMPDIR=${TMPDIR:-unset})"
+    ((skipped++)); continue
+  fi
+  if ! err="$(GIT_INDEX_FILE="$idx" git -C "$dir" read-tree HEAD 2>&1)"; then
+    # Report what git actually said. Guessing at this cost real time once:
+    # a TCC denial and a missing HEAD look identical if the error is discarded.
+    log "SKIP $name: read-tree failed: ${err:-(no message)} [dir=$dir exists=$([[ -d $dir ]] && echo y || echo n) readable=$([[ -r $dir/.git ]] && echo y || echo n)]"
+    rm -f "$idx"; ((skipped++)); continue
+  fi
+  GIT_INDEX_FILE="$idx" git -C "$dir" add -A 2>/dev/null
+  tree="$(GIT_INDEX_FILE="$idx" git -C "$dir" write-tree 2>/dev/null | tr -d '[:space:]')"
+  rm -f "$idx"
+  [[ -n $tree ]] || { log "SKIP $name: could not write tree"; ((skipped++)); continue; }
+
+  # Unchanged since the last run: pushing again would be pure noise.
+  prev="$(grep -F "	$name	" "$STATE" 2>/dev/null | tail -1 | cut -f3)"
+  if [[ $tree == "${prev:-}" ]]; then ((skipped++)); continue; fi
+
+  head="$(git -C "$dir" rev-parse HEAD)"
+  branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+  dirty="$(git -C "$dir" status --porcelain | wc -l | tr -d ' ')"
+  commit="$(git -C "$dir" commit-tree "$tree" -p "$head" \
+      -m "autosave: $branch, $dirty uncommitted change(s), $(date '+%F %T')" \
+      2>/dev/null | tr -d '[:space:]')"
+  [[ -n $commit ]] || { log "FAIL $name: commit-tree"; ((failed++)); continue; }
+
+  if git -C "$dir" push -q --force "$SERVER:$REMOTE_PROJECTS/$name" \
+       "$commit:$REF" 2>/dev/null; then
+    printf 'ts\t%s\t%s\n' "$name" "$tree" >> "$STATE"
+    log "pushed $name ($dirty uncommitted) -> $REF"
+    ((pushed++))
+  else
+    log "FAIL $name: push rejected (does $REMOTE_PROJECTS/$name exist on the server?)"
+    ((failed++))
+  fi
+done < "$CONF"
+
+log "done: $pushed pushed, $skipped unchanged/skipped, $failed failed"

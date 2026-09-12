@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Clone or update ANY of the owner's GitHub repositories, on behalf of a
+# sandboxed Claude Code session, without that session ever being able to read
+# the credential.
+#
+# The session user may run this through sudo but cannot read the token file
+# (root 600) or the askpass helper (root 700). The token is passed to git via
+# GIT_ASKPASS, never on a command line -- /proc/<pid>/cmdline is world-readable
+# on Linux, so a token in a clone URL would be visible to `ps`.
+set -euo pipefail
+
+# One token per GitHub account or organisation. A fine-grained token belongs to
+# exactly one resource owner, so covering several owners means several tokens:
+#   /etc/ccremote-git.d/<owner>.token     e.g. alice.token, my-org.token
+# /etc/ccremote-git.token is the fallback for owners with no file of their own
+# (a classic token, which is account-wide, works there).
+TOKEN_DIR=/etc/ccremote-git.d
+TOKEN_FILE=/etc/ccremote-git.token
+ASKPASS=/usr/local/libexec/ccr-askpass
+APP_USER="${APP_USER:-claude}"
+PROJECTS="$(getent passwd "$APP_USER" | cut -d: -f6)/projects"
+
+die() { echo "ccr-git: $*" >&2; exit 2; }
+[[ $EUID -eq 0 ]] || die "must be run through sudo"
+
+# Owner names are case-insensitive on GitHub; token files are lowercase.
+token_for() {
+  local owner; owner="$(printf '%s' "${1%%/*}" | tr '[:upper:]' '[:lower:]')"
+  if [[ -r "$TOKEN_DIR/$owner.token" ]]; then
+    printf '%s' "$TOKEN_DIR/$owner.token"
+  elif [[ -r $TOKEN_FILE ]]; then
+    printf '%s' "$TOKEN_FILE"
+  else
+    die "no token for '$owner' -- add $TOKEN_DIR/$owner.token"
+  fi
+}
+
+# owner/name only. Rejects flags, paths, URLs and anything that could turn into
+# a git option (--upload-pack=... would run an arbitrary command).
+valid_repo() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+valid_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  clone)
+    repo="${1:-}"; name="${2:-}"
+    valid_repo "$repo" || die "repository must be owner/name"
+    repo="${repo%.git}"
+    [[ -n $name ]] || name="${repo##*/}"
+    valid_name "$name" || die "destination must be a plain folder name"
+    target="$PROJECTS/$name"
+    [[ -e $target ]] && die "$name already exists -- use 'pull' to update it"
+    CCR_TOKEN_FILE="$(token_for "$repo")" GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0 \
+      git clone --quiet "https://x-access-token@github.com/$repo.git" "$target" \
+      || die "clone failed (is $repo spelled right, and does the token cover it?)"
+    # The remote must not keep the username, or a later push prompts oddly.
+    git -C "$target" remote set-url origin "https://github.com/$repo.git"
+    chown -R "$APP_USER:$APP_USER" "$target"
+    echo "cloned $repo into $target"
+    ;;
+  pull)
+    name="${1:-}"
+    valid_name "$name" || die "folder must be a plain name under projects/"
+    target="$PROJECTS/$name"
+    [[ -d $target/.git ]] || die "$name is not a git repository"
+    url="$(git -C "$target" remote get-url origin)"
+    [[ $url =~ ^https://github\.com/([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*)(\.git)?$ ]] \
+      || die "origin is not a plain github.com https remote"
+    repo="${BASH_REMATCH[1]}"
+    # Runs as root like clone does: the askpass helper and the token file are
+    # root-only, so git run as the session user could never authenticate.
+    # safe.directory is needed because the checkout belongs to $APP_USER.
+    CCR_TOKEN_FILE="$(token_for "$repo")" GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0 \
+      git -c "safe.directory=$target" -C "$target" pull --quiet --ff-only \
+      || die "pull failed (local changes, or a diverged branch?)"
+    chown -R "$APP_USER:$APP_USER" "$target"
+    echo "pulled $name"
+    ;;
+  list)
+    # Every configured token, so the list spans all the owners you set up.
+    # Counted before the pipeline: a variable set inside `{ ...; } | sort`
+    # lives in a subshell and would read as 0 out here.
+    found=0
+    for tf in "$TOKEN_DIR"/*.token "$TOKEN_FILE"; do [[ -r $tf ]] && found=1; done
+    [[ $found -eq 1 ]] || die "no GitHub token configured on this server"
+    { for tf in "$TOKEN_DIR"/*.token "$TOKEN_FILE"; do
+      [[ -r $tf ]] || continue
+      curl -sf -H "Authorization: Bearer $(cat "$tf")" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member" \
+        | grep -o '"full_name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4
+      curl -sf -H "Authorization: Bearer $(cat "$tf")" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/installation/repositories?per_page=100" 2>/dev/null \
+        | grep -o '"full_name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4
+    done; } | sort -u
+    ;;
+  *)
+    die "usage: sudo ccr-git {clone <owner/repo> [folder] | pull <folder> | list}"
+    ;;
+esac
