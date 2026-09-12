@@ -108,10 +108,17 @@ sudo ccr-git pull <dir>              updates it
 
 The obvious alternative — a token in the session user's `~/.git-credentials` —
 would let any `full` session read it and push anywhere you can. So instead
-`ccr-git` runs git as root and hands the token to it through `GIT_ASKPASS`,
+`ccr-git` keeps the token root-only and hands it to git through `GIT_ASKPASS`,
 never on a command line: `/proc/<pid>/cmdline` is world-readable on Linux, so a
 token inside a clone URL is visible to `ps`. The session may invoke the helper
 through a single `NOPASSWD` sudoers entry and nothing else.
+
+Root never runs git inside your checkout. It talks to GitHub only from a
+root-owned bare mirror under `/var/lib/ccremote/mirrors/`, and your folder is
+cloned or fast-forwarded *from that mirror* as the session user. This matters:
+`.git/hooks/*` and `core.fsmonitor` in `.git/config` are code, and a session
+can write both — root running `git pull` in that folder would be root for the
+session.
 
 Arguments are validated as `owner/name` plus a plain folder name, so no git
 option can be smuggled in — `--upload-pack=<command>` would otherwise be remote
@@ -292,6 +299,38 @@ default profile (it reads any file on the host), `.sheet{display:flex}` beating
 the UA's `[hidden]{display:none}` (the settings sheet would not close and the
 "Working…" bar never cleared), and static assets served with an ETag but no
 `Cache-Control`, so every future fix would appear not to work.
+
+## Threat model — what is and isn't protected
+
+Be clear about this before pointing a `full` profile at anything.
+
+**Protected:**
+
+* The API: nothing but `/api/health` answers without the token, and the token
+  is only ever sent over Tailscale HTTPS. Nothing listens on a public port.
+* The disk outside `~/projects`: the workspace root is enforced after symlink
+  resolution, and `--restricted` confines Claude's own file tools to the folder.
+* Root: the only `sudo` the session user has is `ccr-git` (validated
+  arguments, never runs git in a user-writable repo) and `systemctl restart
+  ccremote`. Secrets in `/etc` are root-only.
+* GitHub tokens: root-only files, handed to git via `GIT_ASKPASS`, never argv.
+* The phone UI: model output is escaped before the small markdown subset is
+  applied; links are `http(s)` only.
+
+**Not protected, by design — the session user is one Linux user:**
+
+* Every session runs as `claude`, and so does the orchestrator. A `full`
+  session, or a `default` one running `npm run` / `make` / `pytest` (all of
+  which execute whatever the repo says), can do anything that user can: read
+  every other session's transcript in `data/runs.sqlite3`, read
+  `CLAUDE_CODE_OAUTH_TOKEN` from its own environment (it needs it to
+  authenticate), and reach the orchestrator's token via `/proc/<pid>/environ`.
+* A malicious repository is therefore code execution as `claude`. Only clone
+  what you would run on your own laptop.
+
+If you need sessions isolated from the orchestrator and from each other, run
+the orchestrator as a separate user and give each project its own — that is a
+deployment change, not a code change, and it is not done here.
 
 ## Notes
 

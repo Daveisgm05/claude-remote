@@ -7,6 +7,12 @@
 # (root 600) or the askpass helper (root 700). The token is passed to git via
 # GIT_ASKPASS, never on a command line -- /proc/<pid>/cmdline is world-readable
 # on Linux, so a token in a clone URL would be visible to `ps`.
+#
+# Root only ever runs git in /var/lib/ccremote/mirrors, which root owns. The
+# user's checkout is cloned/pulled FROM that mirror as the user. Root never
+# executes git inside a user-writable repo, because .git/hooks and .git/config
+# (core.fsmonitor, etc.) are code, and code in a user-owned repo run by root
+# is root for the user.
 set -euo pipefail
 
 # One token per GitHub account or organisation. A fine-grained token belongs to
@@ -40,6 +46,30 @@ token_for() {
 valid_repo() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 valid_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 
+# Root never runs git inside a folder the session user can write to. A
+# .git/hooks/* script or a core.fsmonitor line in .git/config would otherwise
+# execute as root the next time root touched that repo. So GitHub is only ever
+# talked to from a root-owned bare mirror, and the user's checkout is filled
+# from that mirror by the user, with no token in play.
+MIRRORS=/var/lib/ccremote/mirrors
+as_user() { runuser -u "$APP_USER" -- "$@"; }
+
+sync_mirror() {   # sync_mirror owner/name folder  -> mirror up to date
+  local repo="$1" name="$2" mirror="$MIRRORS/$2.git"
+  install -d -m 755 -o root -g root "$MIRRORS"
+  if [[ ! -d $mirror ]]; then
+    CCR_TOKEN_FILE="$(token_for "$repo")" GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0 \
+      git clone --quiet --mirror "https://x-access-token@github.com/$repo.git" "$mirror" \
+      || die "clone failed (is $repo spelled right, and does the token cover it?)"
+  else
+    CCR_TOKEN_FILE="$(token_for "$repo")" GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0 \
+      git -C "$mirror" remote update --prune >/dev/null 2>&1 \
+      || die "fetch failed (does the token still cover $repo?)"
+  fi
+  # The mirror is read by $APP_USER's git; owned by root so its config is root's.
+  chmod -R a+rX "$mirror"
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
   clone)
@@ -50,12 +80,10 @@ case "$cmd" in
     valid_name "$name" || die "destination must be a plain folder name"
     target="$PROJECTS/$name"
     [[ -e $target ]] && die "$name already exists -- use 'pull' to update it"
-    CCR_TOKEN_FILE="$(token_for "$repo")" GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0 \
-      git clone --quiet "https://x-access-token@github.com/$repo.git" "$target" \
-      || die "clone failed (is $repo spelled right, and does the token cover it?)"
-    # The remote must not keep the username, or a later push prompts oddly.
-    git -C "$target" remote set-url origin "https://github.com/$repo.git"
-    chown -R "$APP_USER:$APP_USER" "$target"
+    sync_mirror "$repo" "$name"
+    as_user git clone --quiet "$MIRRORS/$name.git" "$target" || die "clone from mirror failed"
+    # origin points at GitHub like a normal clone; pushes need the user's own auth.
+    as_user git -C "$target" remote set-url origin "https://github.com/$repo.git"
     echo "cloned $repo into $target"
     ;;
   pull)
@@ -63,18 +91,17 @@ case "$cmd" in
     valid_name "$name" || die "folder must be a plain name under projects/"
     target="$PROJECTS/$name"
     [[ -d $target/.git ]] || die "$name is not a git repository"
-    url="$(git -C "$target" remote get-url origin)"
+    # Read the origin as the user too: .git/config is user-controlled input.
+    url="$(as_user git -C "$target" remote get-url origin)"
     [[ $url =~ ^https://github\.com/([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*)(\.git)?$ ]] \
       || die "origin is not a plain github.com https remote"
     repo="${BASH_REMATCH[1]}"
-    # Runs as root like clone does: the askpass helper and the token file are
-    # root-only, so git run as the session user could never authenticate.
-    # safe.directory is needed because the checkout belongs to $APP_USER.
-    CCR_TOKEN_FILE="$(token_for "$repo")" GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0 \
-      git -c "safe.directory=$target" -C "$target" pull --quiet --ff-only \
+    sync_mirror "$repo" "$name"
+    branch="$(as_user git -C "$target" symbolic-ref --short HEAD 2>/dev/null)" \
+      || die "$name has no branch checked out"
+    as_user git -C "$target" pull --quiet --ff-only "$MIRRORS/$name.git" "$branch" \
       || die "pull failed (local changes, or a diverged branch?)"
-    chown -R "$APP_USER:$APP_USER" "$target"
-    echo "pulled $name"
+    echo "pulled $name ($branch)"
     ;;
   list)
     # Every configured token, so the list spans all the owners you set up.
@@ -83,16 +110,17 @@ case "$cmd" in
     found=0
     for tf in "$TOKEN_DIR"/*.token "$TOKEN_FILE"; do [[ -r $tf ]] && found=1; done
     [[ $found -eq 1 ]] || die "no GitHub token configured on this server"
+    # The token goes to curl as a config file on stdin (-K -), not as a -H
+    # argument: argv is world-readable in /proc, a pipe is not.
+    gh_get() {
+      printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\nurl = "%s"\n' \
+        "$(cat "$1")" "$2" | curl -sf -K - 2>/dev/null \
+        | grep -o '"full_name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4
+    }
     { for tf in "$TOKEN_DIR"/*.token "$TOKEN_FILE"; do
       [[ -r $tf ]] || continue
-      curl -sf -H "Authorization: Bearer $(cat "$tf")" \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member" \
-        | grep -o '"full_name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4
-      curl -sf -H "Authorization: Bearer $(cat "$tf")" \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/installation/repositories?per_page=100" 2>/dev/null \
-        | grep -o '"full_name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4
+      gh_get "$tf" "https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member"
+      gh_get "$tf" "https://api.github.com/installation/repositories?per_page=100"
     done; } | sort -u
     ;;
   *)
