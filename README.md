@@ -159,9 +159,11 @@ Four properties, each chosen deliberately:
   silently means "use the real one".
 * **Nothing reaches GitHub.** The push goes Mac -> your server. One of these
   repos is public; auto-pushing work in progress there would publish it.
-* **The server is undisturbed.** `autosave/mac` is never the checked-out branch,
-  so a phone session mid-run cannot be affected. Branch off it (`git checkout -b
-  work autosave/mac`) rather than working on it: the Mac force-pushes that ref.
+* **The server follows the Mac.** After each push, if the server's checkout is
+  on a branch named `mac` and has no local edits, it is moved onto the snapshot,
+  so a phone session runs what is on the laptop right now. Set it up once with
+  `git checkout -B mac autosave/mac` on the server. A server tree with edits is
+  left alone and the log says so; `CCR_FOLLOW=0` disables the step.
 * **`.gitignore` is honoured**, so `node_modules` never crosses the wire. On
   these repos that is ~500 tracked files instead of 4 GB.
 

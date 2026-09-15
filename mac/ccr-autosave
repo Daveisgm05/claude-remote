@@ -89,6 +89,21 @@ while IFS=$'\t' read -r dir name; do
     printf 'ts\t%s\t%s\n' "$name" "$tree" >> "$STATE"
     log "pushed $name ($dirty uncommitted) -> $REF"
     ((pushed++))
+    # FOLLOW: move the server's checkout onto the snapshot, so a phone session
+    # runs what is on this Mac right now. Only when the server tree is clean
+    # (an edit made there is never thrown away) and only on the 'mac' branch
+    # (a server that deliberately sits elsewhere is left alone).
+    if [[ ${CCR_FOLLOW:-1} == 1 ]]; then
+      msg="$(ssh -o BatchMode=yes "$SERVER" "cd '$REMOTE_PROJECTS/$name' 2>/dev/null || exit 0
+        [[ \$(git branch --show-current) == mac ]] || { echo 'not on mac branch'; exit 0; }
+        [[ -z \$(git status --porcelain --untracked-files=no) ]] || { echo 'local edits present'; exit 0; }
+        git reset -q --hard '$commit' && echo followed" 2>/dev/null)"
+      case "$msg" in
+        followed) log "  server checkout now at ${commit:0:8}" ;;
+        "")       ;;
+        *)        log "  server NOT updated: $msg (fix there: git stash && git reset --hard $REF)" ;;
+      esac
+    fi
   else
     log "FAIL $name: push rejected (does $REMOTE_PROJECTS/$name exist on the server?)"
     ((failed++))
